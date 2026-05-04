@@ -1,6 +1,16 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_database_url(url: str) -> str:
+    """
+    Ensure SQLAlchemy uses psycopg v3 driver.
+    Supabase/Vercel commonly provide postgresql:// URLs, which default to psycopg2.
+    """
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
+
+
 class Settings(BaseSettings):
     app_name: str = "SHS Voice Diagnostic Agent"
     database_url: str = "postgresql+psycopg://postgres:postgres@db:5432/shs_voice"
