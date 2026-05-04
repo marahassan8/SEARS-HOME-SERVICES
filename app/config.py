@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_from_email: str = "no-reply@shs.local"
 
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_sms_from: str | None = None
+
+    upload_dir: str = "/tmp/uploads"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

@@ -10,9 +10,10 @@ from twilio.twiml.voice_response import Gather, VoiceResponse
 from app.config import settings
 from app.database import get_db
 from app.models import Appointment, CallSession, TechnicianAvailability
-from services.communications import send_image_upload_email
+from services.communications import send_email_entry_link_sms
 from services.diagnostics import detect_appliance_type, troubleshooting_steps
-from services.llm_agent import extract_appliance_type, should_request_image
+from services.image_upload_flow import grant_upload_link_for_verified_email
+from services.llm_agent import extract_appliance_type, extract_email_from_speech, should_request_image
 from services.scheduling import get_matching_slots, parse_preferred_window
 
 router = APIRouter(prefix="/voice", tags=["voice"])
@@ -89,6 +90,28 @@ def _extract_email(text: str) -> str | None:
     return candidate if match else None
 
 
+def _wants_sms_email_link(text: str) -> bool:
+    t = (text or "").lower()
+    return any(
+        k in t
+        for k in (
+            "text link",
+            "text me",
+            "send a text",
+            "send me a text",
+            "sms",
+            "message me",
+            "type my email",
+            "type it",
+        )
+    )
+
+
+def _email_for_speech(email: str) -> str:
+    local, _, domain = email.partition("@")
+    return f"{local} at {domain.replace('.', ' dot ')}"
+
+
 @router.post("/incoming")
 def incoming_call(CallSid: str = Form(...), db: Session = Depends(get_db)):
     _load_or_create_session(db, CallSid)
@@ -111,7 +134,7 @@ def respond(
     utterance = (SpeechResult or "").strip()
 
     if session.stage == "collect_appliance":
-        appliance = extract_appliance_type(utterance) or detect_appliance_type(utterance)
+        appliance = extract_appliance_type(utterance, call_sid=CallSid) or detect_appliance_type(utterance)
         if not appliance:
             response = _say_and_gather(
                 "I did not catch the appliance type. Please say washer, dryer, refrigerator, "
@@ -161,34 +184,99 @@ def respond(
 
     if session.stage == "collect_unusual_sound":
         session.unusual_sound = utterance
+        session.troubleshooting_step_index = 0
         if should_request_image(session.symptom or "", session.error_code, session.unusual_sound):
             session.stage = "collect_email_for_image"
-        else:
-            session.stage = "troubleshoot"
-        session.troubleshooting_step_index = 0
+            if not session.email_entry_token:
+                session.email_entry_token = uuid4().hex
+            db.commit()
+            response = _say_and_gather(
+                "A photo may help us diagnose the issue. Please say your email slowly, for example jane at gmail dot com. "
+                "If that is hard by phone, say text link and we will text you a page where you can type your email. "
+                "I will read your email back so you can confirm it.",
+                "/voice/respond",
+            )
+            return Response(content=str(response), media_type="application/xml")
+        session.stage = "troubleshoot"
         db.commit()
 
     if session.stage == "collect_email_for_image":
-        email = _extract_email(utterance)
-        if not email:
+        if not session.email_entry_token:
+            session.email_entry_token = uuid4().hex
+            db.commit()
+
+        if _wants_sms_email_link(utterance):
+            sent = send_email_entry_link_sms(From, session.email_entry_token)
+            if sent:
+                follow = "I sent a text to this number with a link. Type your email there, then say continue here."
+            else:
+                follow = (
+                    "I could not send a text from this line. Please say your email slowly."
+                )
+            response = _say_and_gather(f"{follow} Say continue when ready, or say your email now.", "/voice/respond")
+            return Response(content=str(response), media_type="application/xml")
+
+        if utterance.lower().strip() in {"continue", "ready", "next", "okay", "ok"}:
             response = _say_and_gather(
-                "A photo can help diagnosis. Please say your email address clearly, for example name at mail dot com.",
+                "Please say your email now, or say text link for a text with a typing page.",
                 "/voice/respond",
             )
             return Response(content=str(response), media_type="application/xml")
 
-        token = uuid4().hex
-        session.customer_email = email
-        session.image_upload_token = token
-        session.stage = "troubleshoot"
-        db.commit()
+        email = extract_email_from_speech(utterance, call_sid=CallSid) or _extract_email(utterance)
+        if not email:
+            response = _say_and_gather(
+                "I did not catch a valid email. Say it again slowly, or say text link and I will text you a typing page.",
+                "/voice/respond",
+            )
+            return Response(content=str(response), media_type="application/xml")
 
-        upload_url = f"{settings.public_base_url.rstrip('/')}/media/upload/{token}"
-        send_image_upload_email(email, upload_url)
+        session.pending_email = email
+        session.stage = "confirm_email_for_image"
+        db.commit()
+        spoken = _email_for_speech(email)
+        response = _say_and_gather(
+            f"I heard {spoken}. Say yes if that is correct. If not, say your full email again.",
+            "/voice/respond",
+        )
+        return Response(content=str(response), media_type="application/xml")
+
+    if session.stage == "confirm_email_for_image":
+        lowered = utterance.lower()
+        if any(
+            w in lowered
+            for w in ("yes", "yeah", "yep", "correct", "right", "confirm", "that's right", "thats right", "sure")
+        ):
+            pending = session.pending_email
+            if not pending:
+                session.stage = "collect_email_for_image"
+                db.commit()
+                response = _say_and_gather(
+                    "I lost the pending email. Please say your email again.",
+                    "/voice/respond",
+                )
+                return Response(content=str(response), media_type="application/xml")
+            grant_upload_link_for_verified_email(db, session, pending)
+            response = _say_and_gather(
+                "Thank you. I sent a secure photo upload link to that email. "
+                "You can upload now or after this call. Let us continue troubleshooting.",
+                "/voice/respond",
+            )
+            return Response(content=str(response), media_type="application/xml")
+
+        email = extract_email_from_speech(utterance, call_sid=CallSid) or _extract_email(utterance)
+        if email:
+            session.pending_email = email
+            db.commit()
+            spoken = _email_for_speech(email)
+            response = _say_and_gather(
+                f"Updated. I heard {spoken}. Say yes if that is correct, or say your full email again.",
+                "/voice/respond",
+            )
+            return Response(content=str(response), media_type="application/xml")
 
         response = _say_and_gather(
-            "Thank you. I just sent a secure photo upload link to your email. "
-            "You can upload now or after this call. Let us continue troubleshooting.",
+            "Say yes to confirm your email, or say your full email again.",
             "/voice/respond",
         )
         return Response(content=str(response), media_type="application/xml")
@@ -255,13 +343,25 @@ def respond(
             )
         )
         if not matches:
-            response = VoiceResponse()
-            response.say(
-                "I am sorry, I could not find an available technician for that time window. "
-                "A representative will follow up shortly.",
-                voice="alice",
+            # Keep the caller in an interactive scheduling loop.
+            if preferred_window != "any":
+                session.stage = "collect_window"
+                db.commit()
+                response = _say_and_gather(
+                    "I could not find availability for that time window. "
+                    "Would morning, afternoon, evening, or any time work instead?",
+                    "/voice/respond",
+                )
+                return Response(content=str(response), media_type="application/xml")
+
+            # No matches even for "any" time. Try a different ZIP rather than ending the call.
+            session.stage = "collect_zip"
+            db.commit()
+            response = _say_and_gather(
+                "I could not find any available technician times for that ZIP code right now. "
+                "If you have another nearby ZIP code, please say it now. Otherwise say agent and we will arrange a callback.",
+                "/voice/respond",
             )
-            response.hangup()
             return Response(content=str(response), media_type="application/xml")
 
         tech, slot = matches[0]
@@ -311,12 +411,15 @@ def respond(
             response.hangup()
             return Response(content=str(response), media_type="application/xml")
 
-        response = VoiceResponse()
-        response.say(
-            "No problem. I have not booked the appointment. A representative will follow up with you shortly.",
-            voice="alice",
+        # Caller declined the proposed slot; offer to try alternate windows instead of ending the call.
+        session.selected_availability_id = None
+        session.stage = "collect_window"
+        db.commit()
+        response = _say_and_gather(
+            "No problem. Let us find another time. "
+            "Would morning, afternoon, evening, or any time work best?",
+            "/voice/respond",
         )
-        response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
     response = VoiceResponse()

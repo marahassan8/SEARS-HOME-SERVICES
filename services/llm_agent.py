@@ -1,11 +1,17 @@
 import base64
 import json
+import logging
+import re
 from dataclasses import dataclass
 
 from openai import OpenAI
 
 from app.config import settings
 from services.diagnostics import detect_appliance_type
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._%+\-]{0,63}@[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,}$")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,13 +27,60 @@ def _client() -> OpenAI | None:
     return OpenAI(api_key=settings.openai_api_key)
 
 
-def extract_appliance_type(utterance: str) -> str | None:
+def extract_email_from_speech(utterance: str, *, call_sid: str | None = None) -> str | None:
+    """
+    Parse a messy speech-to-text transcript into a single RFC-shaped email or None.
+    """
+    text = (utterance or "").strip()
+    if not text:
+        return None
+    client = _client()
+    if client is None:
+        return None
+    try:
+        logger.info(
+            "openai_call purpose=extract_email model=%s call_sid=%s",
+            settings.llm_model,
+            call_sid or "-",
+        )
+        response = client.responses.create(
+            model=settings.llm_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You normalize caller email addresses from noisy phone speech transcripts. "
+                        "Return strict JSON with one key: email. "
+                        "Value must be a single valid email in lowercase, or null if you cannot infer it. "
+                        "Fix common STT errors: 'at the rate', 'at', 'dot', missing dots in gmail/outlook/yahoo. "
+                        "Do not invent domains; if unsure return null."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        payload = json.loads(response.output_text.strip())
+        raw = payload.get("email")
+        if raw is None or raw == "null":
+            return None
+        candidate = str(raw).strip().lower()
+        return candidate if _EMAIL_RE.match(candidate) else None
+    except Exception:
+        return None
+
+
+def extract_appliance_type(utterance: str, *, call_sid: str | None = None) -> str | None:
     fallback = detect_appliance_type(utterance)
     client = _client()
     if client is None:
         return fallback
 
     try:
+        logger.info(
+            "openai_call purpose=extract_appliance model=%s call_sid=%s",
+            settings.llm_model,
+            call_sid or "-",
+        )
         response = client.responses.create(
             model=settings.llm_model,
             input=[
@@ -57,7 +110,9 @@ def should_request_image(symptom: str, error_code: str | None, unusual_sound: st
     return len(text) > 30
 
 
-def analyze_appliance_image(image_bytes: bytes, reported_appliance_type: str | None) -> VisionResult:
+def analyze_appliance_image(
+    image_bytes: bytes, reported_appliance_type: str | None, *, call_sid: str | None = None
+) -> VisionResult:
     client = _client()
     if client is None:
         return VisionResult(
@@ -68,6 +123,12 @@ def analyze_appliance_image(image_bytes: bytes, reported_appliance_type: str | N
 
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     try:
+        logger.info(
+            "openai_call purpose=vision_analyze model=%s call_sid=%s image_bytes=%s",
+            settings.vision_model,
+            call_sid or "-",
+            len(image_bytes),
+        )
         response = client.responses.create(
             model=settings.vision_model,
             input=[

@@ -82,6 +82,8 @@ class CallSession(Base):
     preferred_window: Mapped[str | None] = mapped_column(String(20), nullable=True)
     selected_availability_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_entry_token: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True, index=True)
     image_upload_token: Mapped[str | None] = mapped_column(String(120), nullable=True)
     image_uploaded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     image_analysis_summary: Mapped[str | None] = mapped_column(Text, nullable=True)

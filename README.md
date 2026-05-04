@@ -60,13 +60,12 @@ End-to-end inbound voice agent for Sears Home Services assessment (Tier 1 + Tier
 
 ## Tier 3 Visual Diagnosis Flow
 1. Agent asks for customer email when visual context is likely helpful.
-2. Backend generates a unique upload token and emails a secure upload link.
-3. Customer uploads image at `/media/upload/{token}`.
-4. Vision analysis stores:
-   - detected appliance type
-   - visible issues summary
-   - recommended next step
-5. Voice flow uses that analysis in follow-up troubleshooting guidance.
+2. Email capture uses **OpenAI normalization** plus regex, then a **spoken confirmation** step.
+3. Optional: say **text link** to receive an SMS with `/media/enter-email/{token}` where you can **type** the email.
+4. Backend emails a secure upload link after the email is confirmed or submitted on the web form.
+5. Customer uploads image at `/media/upload/{token}`.
+6. Vision analysis stores detected appliance type, visible issues summary, and recommended next step.
+7. Voice flow uses that analysis in follow-up troubleshooting guidance.
 
 ## Call Flow
 1. Greeting and appliance identification
