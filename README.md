@@ -109,4 +109,4 @@ Use `.env.example` as reference. Important keys:
   - Add authentication for internal admin endpoints
   - Add retries/observability/logging
   - Add conflict-safe booking transaction isolation and idempotency keys
-  - Upgrade from TwiML gather loops to Twilio Media Streams for low-latency streaming STT/TTS
+  - Upgrade from TwiML gather loops to Twilio Media Streams for low latency streaming STT/TTS
