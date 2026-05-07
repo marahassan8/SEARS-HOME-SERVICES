@@ -10,8 +10,30 @@ from app.config import settings
 from services.diagnostics import detect_appliance_type
 
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._%+\-]{0,63}@[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,}$")
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    """Tolerantly parse a JSON object from a model response.
+
+    Handles plain JSON, code-fenced JSON, and JSON wrapped in extra prose.
+    Returns ``None`` when no object can be parsed.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    match = _JSON_OBJECT_RE.search(raw)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
 
 
 @dataclass
@@ -52,14 +74,18 @@ def extract_email_from_speech(utterance: str, *, call_sid: str | None = None) ->
                         "You normalize caller email addresses from noisy phone speech transcripts. "
                         "Return strict JSON with one key: email. "
                         "Value must be a single valid email in lowercase, or null if you cannot infer it. "
-                        "Fix common STT errors: 'at the rate', 'at', 'dot', missing dots in gmail/outlook/yahoo. "
+                        "Fix common STT errors: 'at the rate', 'at', 'dot', spelled-out digits "
+                        "(e.g. 'eight' -> '8'), missing dots in gmail/outlook/yahoo. "
                         "Do not invent domains; if unsure return null."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            text={"format": {"type": "json_object"}},
         )
-        payload = json.loads(response.output_text.strip())
+        payload = _parse_json_object(response.output_text or "")
+        if not payload:
+            return None
         raw = payload.get("email")
         if raw is None or raw == "null":
             return None
@@ -93,8 +119,9 @@ def extract_appliance_type(utterance: str, *, call_sid: str | None = None) -> st
                 },
                 {"role": "user", "content": utterance},
             ],
+            text={"format": {"type": "json_object"}},
         )
-        payload = json.loads(response.output_text.strip())
+        payload = _parse_json_object(response.output_text or "") or {}
         parsed = payload.get("appliance_type")
         if parsed in {"washer", "dryer", "refrigerator", "dishwasher", "oven", "hvac"}:
             return parsed
@@ -154,8 +181,9 @@ def analyze_appliance_image(
                     ],
                 },
             ],
+            text={"format": {"type": "json_object"}},
         )
-        parsed = json.loads(response.output_text.strip())
+        parsed = _parse_json_object(response.output_text or "") or {}
         appliance = parsed.get("appliance_type")
         if appliance == "unknown":
             appliance = reported_appliance_type

@@ -15,16 +15,22 @@ def _resolve_smtp_from() -> str:
     """
     SMTP servers require a valid mailbox in From (e.g. noreply@yourdomain.com).
     Bare hostnames like smtp.example.com or MailerSend sandbox IDs are invalid.
+
+    Two-pass: prefer a fully-valid candidate (so SMTP_USERNAME — typically the
+    verified trial sender — beats a domain-only SMTP_FROM_EMAIL); only as a
+    last resort do we synthesize a noreply@<domain> address.
     """
-    candidates = [settings.smtp_from_email, settings.smtp_username or ""]
-    for raw in candidates:
-        candidate = (raw or "").strip()
-        if not candidate:
-            continue
-        if _EMAIL_RE.match(candidate):
+    candidates = [
+        (settings.smtp_from_email or "").strip(),
+        (settings.smtp_username or "").strip(),
+    ]
+
+    for candidate in candidates:
+        if candidate and _EMAIL_RE.match(candidate):
             return candidate
-        # User pasted only a domain — common mistake with transactional providers
-        if "@" not in candidate and "." in candidate and " " not in candidate:
+
+    for candidate in candidates:
+        if candidate and "@" not in candidate and "." in candidate and " " not in candidate:
             guessed = f"noreply@{candidate.lstrip('@')}"
             if _EMAIL_RE.match(guessed):
                 logger.warning(
@@ -32,6 +38,7 @@ def _resolve_smtp_from() -> str:
                     guessed,
                 )
                 return guessed
+
     return "no-reply@shs.local"
 
 
@@ -53,13 +60,14 @@ def send_image_upload_email(recipient: str, upload_url: str) -> None:
     )
 
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as smtp:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
             smtp.starttls()
             if settings.smtp_username and settings.smtp_password:
                 smtp.login(settings.smtp_username, settings.smtp_password)
             smtp.send_message(message)
-    except smtplib.SMTPException as exc:
-        logger.exception("SMTP send failed; falling back to console log: %s", exc)
+        logger.info("Sent appliance upload link to %s from %s", recipient, from_addr)
+    except (smtplib.SMTPException, OSError) as exc:
+        logger.exception("SMTP send failed (from=%s, to=%s): %s", from_addr, recipient, exc)
         print(f"[SMTP FAILED] Upload link for {recipient}: {upload_url}")
         print(f"[SMTP FAILED] Fix SMTP_FROM_EMAIL to a verified address like you@yourdomain.com — error: {exc}")
 

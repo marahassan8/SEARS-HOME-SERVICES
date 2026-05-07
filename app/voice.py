@@ -15,11 +15,12 @@ from services.diagnostics import detect_appliance_type, troubleshooting_steps
 from services.image_upload_flow import grant_upload_link_for_verified_email
 from services.llm_agent import extract_appliance_type, extract_email_from_speech, should_request_image
 from services.scheduling import get_matching_slots, parse_preferred_window
+from services.speech_normalize import extract_zip_code, words_to_digits
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 MAX_EMAIL_RETRIES = 3
 MAX_SCHEDULING_RETRIES = 3
-MAX_ZIP_RETRIES = 2
+MAX_ZIP_RETRIES = 3
 
 
 def _say_and_gather(message: str, action: str) -> VoiceResponse:
@@ -30,6 +31,31 @@ def _say_and_gather(message: str, action: str) -> VoiceResponse:
         action=action,
         method="POST",
         speech_model=settings.twilio_speech_model,
+    )
+    gather.say(message, voice=settings.twilio_voice)
+    response.append(gather)
+    response.redirect(action, method="POST")
+    return response
+
+
+def _say_and_gather_zip(message: str, action: str) -> VoiceResponse:
+    """Gather a 5-digit ZIP via either speech or DTMF keypad.
+
+    Speech-only capture is unreliable on Twilio's phone_call model — spoken
+    digits often come back as words. Allowing DTMF gives the caller a
+    deterministic fallback when STT struggles with their accent or line.
+    """
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech dtmf",
+        speech_timeout="auto",
+        timeout=8,
+        num_digits=5,
+        finish_on_key="#",
+        action=action,
+        method="POST",
+        speech_model=settings.twilio_speech_model,
+        hints="0,1,2,3,4,5,6,7,8,9,zero,one,two,three,four,five,six,seven,eight,nine,oh",
     )
     gather.say(message, voice=settings.twilio_voice)
     response.append(gather)
@@ -49,29 +75,39 @@ def _load_or_create_session(db: Session, call_sid: str) -> CallSession:
 
 
 def _extract_email(text: str) -> str | None:
-    lowered = text.lower().strip()
+    # Pad with surrounding spaces so word-boundary replacements
+    # ("...janed at gmail...") match even when they start/end the utterance.
+    lowered = f" {text.lower().strip()} "
 
     replacements = {
         " at the rate of ": " @ ",
         " at rate of ": " @ ",
+        " at the rate ": " @ ",
         " rate of ": " @ ",
         " at symbol ": " @ ",
+        " at sign ": " @ ",
         " at ": " @ ",
         " dot ": " . ",
         " period ": " . ",
+        " full stop ": " . ",
         " underscore ": " _ ",
         " hyphen ": " - ",
         " dash ": " - ",
+        " minus ": " - ",
         " plus ": " + ",
     }
     for source, target in replacements.items():
         lowered = lowered.replace(source, target)
 
+    # Translate spelled-out digit words ("eight" -> "8") so emails like
+    # "marhassan8@gmail.com" survive Twilio's word-form digit transcription.
+    lowered = words_to_digits(lowered)
+
     tokens = re.findall(r"[a-z0-9]+|[@._+\-]", lowered)
     if not tokens:
         return None
 
-    filler_tokens = {"my", "is", "email", "address", "it", "is", "the", "a", "an", "and", "please"}
+    filler_tokens = {"my", "is", "email", "address", "it", "the", "a", "an", "and", "please", "thats"}
     tokens = [token for token in tokens if token not in filler_tokens]
 
     if "@" not in tokens:
@@ -148,9 +184,14 @@ def respond(
     CallSid: str = Form(...),
     From: str = Form(default="unknown"),
     SpeechResult: str = Form(default=""),
+    Digits: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
     session = _load_or_create_session(db, CallSid)
+    # DTMF wins over speech: when the caller pressed keys, the digits string
+    # is the source of truth for numeric input (ZIP). For non-numeric stages
+    # we still drop back to SpeechResult.
+    digits = (Digits or "").strip()
     utterance = (SpeechResult or "").strip()
     lowered = utterance.lower()
 
@@ -363,9 +404,9 @@ def respond(
         session.scheduling_retry_count = 0
         session.zip_retry_count = 0
         db.commit()
-        response = _say_and_gather(
+        response = _say_and_gather_zip(
             "Thanks for trying those steps. I can schedule a technician visit. "
-            "Please say your five digit ZIP code.",
+            "Please say your five digit ZIP code, or enter it on your keypad and press pound.",
             "/voice/respond",
         )
         return Response(content=str(response), media_type="application/xml")
@@ -375,16 +416,16 @@ def respond(
             return _handoff_response(
                 "No problem. A representative will call you to help complete scheduling."
             )
-        zip_candidate = "".join(ch for ch in utterance if ch.isdigit())
-        if len(zip_candidate) != 5:
+        zip_candidate = extract_zip_code(digits) or extract_zip_code(utterance)
+        if not zip_candidate:
             session.zip_retry_count += 1
             db.commit()
-            if session.zip_retry_count > MAX_ZIP_RETRIES:
+            if session.zip_retry_count >= MAX_ZIP_RETRIES:
                 return _handoff_response(
                     "I could not capture a valid ZIP code. A representative will follow up to schedule your service."
                 )
-            response = _say_and_gather(
-                "I need a five digit ZIP code to match technicians. Please repeat your ZIP code.",
+            response = _say_and_gather_zip(
+                "I need a five digit ZIP code. Please say it slowly, or enter it on your keypad and press pound.",
                 "/voice/respond",
             )
             return Response(content=str(response), media_type="application/xml")
@@ -449,10 +490,11 @@ def respond(
             # Retry 3: prompt alternate ZIP.
             if session.scheduling_retry_count <= MAX_SCHEDULING_RETRIES:
                 session.stage = "collect_zip"
+                session.zip_retry_count = 0
                 db.commit()
-                response = _say_and_gather(
+                response = _say_and_gather_zip(
                     "I still could not find an available window. Please say another nearby ZIP code, "
-                    "or say agent for callback scheduling.",
+                    "or enter it on your keypad and press pound. Say agent for callback scheduling.",
                     "/voice/respond",
                 )
                 return Response(content=str(response), media_type="application/xml")
