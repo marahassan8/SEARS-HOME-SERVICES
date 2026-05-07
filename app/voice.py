@@ -17,6 +17,9 @@ from services.llm_agent import extract_appliance_type, extract_email_from_speech
 from services.scheduling import get_matching_slots, parse_preferred_window
 
 router = APIRouter(prefix="/voice", tags=["voice"])
+MAX_EMAIL_RETRIES = 3
+MAX_SCHEDULING_RETRIES = 3
+MAX_ZIP_RETRIES = 2
 
 
 def _say_and_gather(message: str, action: str) -> VoiceResponse:
@@ -112,6 +115,23 @@ def _email_for_speech(email: str) -> str:
     return f"{local} at {domain.replace('.', ' dot ')}"
 
 
+def _wants_agent(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(token in lowered for token in ("agent", "representative", "human", "callback", "call me back"))
+
+
+def _wants_skip(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(token in lowered for token in ("skip", "no image", "without image", "continue"))
+
+
+def _handoff_response(message: str) -> Response:
+    response = VoiceResponse()
+    response.say(message, voice=settings.twilio_voice)
+    response.hangup()
+    return Response(content=str(response), media_type="application/xml")
+
+
 @router.post("/incoming")
 def incoming_call(CallSid: str = Form(...), db: Session = Depends(get_db)):
     _load_or_create_session(db, CallSid)
@@ -132,6 +152,12 @@ def respond(
 ):
     session = _load_or_create_session(db, CallSid)
     utterance = (SpeechResult or "").strip()
+    lowered = utterance.lower()
+
+    if _wants_agent(utterance):
+        return _handoff_response(
+            "Understood. I will have a Sears Home Services representative follow up to complete this request."
+        )
 
     if session.stage == "collect_appliance":
         appliance = extract_appliance_type(utterance, call_sid=CallSid) or detect_appliance_type(utterance)
@@ -145,6 +171,9 @@ def respond(
 
         session.appliance_type = appliance
         session.stage = "collect_symptom"
+        session.email_retry_count = 0
+        session.scheduling_retry_count = 0
+        session.zip_retry_count = 0
         db.commit()
         response = _say_and_gather(
             f"Got it, a {appliance}. Please describe what is going wrong.",
@@ -185,6 +214,7 @@ def respond(
     if session.stage == "collect_unusual_sound":
         session.unusual_sound = utterance
         session.troubleshooting_step_index = 0
+        session.email_retry_count = 0
         if should_request_image(session.symptom or "", session.error_code, session.unusual_sound):
             session.stage = "collect_email_for_image"
             if not session.email_entry_token:
@@ -201,6 +231,16 @@ def respond(
         db.commit()
 
     if session.stage == "collect_email_for_image":
+        if _wants_skip(utterance):
+            session.stage = "troubleshoot"
+            session.email_retry_count = 0
+            db.commit()
+            response = _say_and_gather(
+                "No problem, we will continue without an image for now.",
+                "/voice/respond",
+            )
+            return Response(content=str(response), media_type="application/xml")
+
         if not session.email_entry_token:
             session.email_entry_token = uuid4().hex
             db.commit()
@@ -225,6 +265,20 @@ def respond(
 
         email = extract_email_from_speech(utterance, call_sid=CallSid) or _extract_email(utterance)
         if not email:
+            session.email_retry_count += 1
+            db.commit()
+            if session.email_retry_count >= MAX_EMAIL_RETRIES:
+                sent = send_email_entry_link_sms(From, session.email_entry_token or "")
+                if sent:
+                    response = _say_and_gather(
+                        "I still could not capture the email reliably. I sent you a text link so you can type it. "
+                        "Say continue after submitting, or say skip to proceed without image.",
+                        "/voice/respond",
+                    )
+                    return Response(content=str(response), media_type="application/xml")
+                return _handoff_response(
+                    "I am unable to capture your email on this call. A representative will follow up to assist with photo upload."
+                )
             response = _say_and_gather(
                 "I did not catch a valid email. Say it again slowly, or say text link and I will text you a typing page.",
                 "/voice/respond",
@@ -233,6 +287,7 @@ def respond(
 
         session.pending_email = email
         session.stage = "confirm_email_for_image"
+        session.email_retry_count = 0
         db.commit()
         spoken = _email_for_speech(email)
         response = _say_and_gather(
@@ -242,7 +297,6 @@ def respond(
         return Response(content=str(response), media_type="application/xml")
 
     if session.stage == "confirm_email_for_image":
-        lowered = utterance.lower()
         if any(
             w in lowered
             for w in ("yes", "yeah", "yep", "correct", "right", "confirm", "that's right", "thats right", "sure")
@@ -257,6 +311,7 @@ def respond(
                 )
                 return Response(content=str(response), media_type="application/xml")
             grant_upload_link_for_verified_email(db, session, pending)
+            session.email_retry_count = 0
             response = _say_and_gather(
                 "Thank you. I sent a secure photo upload link to that email. "
                 "You can upload now or after this call. Let us continue troubleshooting.",
@@ -305,6 +360,8 @@ def respond(
             return Response(content=str(response), media_type="application/xml")
 
         session.stage = "collect_zip"
+        session.scheduling_retry_count = 0
+        session.zip_retry_count = 0
         db.commit()
         response = _say_and_gather(
             "Thanks for trying those steps. I can schedule a technician visit. "
@@ -314,8 +371,18 @@ def respond(
         return Response(content=str(response), media_type="application/xml")
 
     if session.stage == "collect_zip":
+        if "skip" in lowered:
+            return _handoff_response(
+                "No problem. A representative will call you to help complete scheduling."
+            )
         zip_candidate = "".join(ch for ch in utterance if ch.isdigit())
         if len(zip_candidate) != 5:
+            session.zip_retry_count += 1
+            db.commit()
+            if session.zip_retry_count > MAX_ZIP_RETRIES:
+                return _handoff_response(
+                    "I could not capture a valid ZIP code. A representative will follow up to schedule your service."
+                )
             response = _say_and_gather(
                 "I need a five digit ZIP code to match technicians. Please repeat your ZIP code.",
                 "/voice/respond",
@@ -323,6 +390,7 @@ def respond(
             return Response(content=str(response), media_type="application/xml")
         session.zip_code = zip_candidate
         session.stage = "collect_window"
+        session.zip_retry_count = 0
         db.commit()
         response = _say_and_gather(
             "What time works best for you: morning, afternoon, evening, or any time?",
@@ -343,30 +411,60 @@ def respond(
             )
         )
         if not matches:
-            # Keep the caller in an interactive scheduling loop.
-            if preferred_window != "any":
-                session.stage = "collect_window"
-                db.commit()
+            session.scheduling_retry_count += 1
+            db.commit()
+
+            # Retry 1: ask for alternative window.
+            if session.scheduling_retry_count == 1 and preferred_window != "any":
                 response = _say_and_gather(
-                    "I could not find availability for that time window. "
+                    "I could not find availability for that window. "
                     "Would morning, afternoon, evening, or any time work instead?",
                     "/voice/respond",
                 )
                 return Response(content=str(response), media_type="application/xml")
 
-            # No matches even for "any" time. Try a different ZIP rather than ending the call.
-            session.stage = "collect_zip"
-            db.commit()
-            response = _say_and_gather(
-                "I could not find any available technician times for that ZIP code right now. "
-                "If you have another nearby ZIP code, please say it now. Otherwise say agent and we will arrange a callback.",
-                "/voice/respond",
+            # Retry 2: automatically broaden to "any" and try again.
+            if session.scheduling_retry_count == 2 and preferred_window != "any":
+                any_matches = list(
+                    get_matching_slots(
+                        db,
+                        zip_code=session.zip_code or "",
+                        appliance_type=session.appliance_type or "",
+                        preferred_window="any",
+                    )
+                )
+                if any_matches:
+                    tech, slot = any_matches[0]
+                    session.selected_availability_id = slot.id
+                    session.stage = "confirm_booking"
+                    session.scheduling_retry_count = 0
+                    db.commit()
+                    response = _say_and_gather(
+                        f"I could not match your requested window, but I found {tech.name} on "
+                        f"{slot.start_time.strftime('%A %B %d at %I:%M %p')}. Would you like this time?",
+                        "/voice/respond",
+                    )
+                    return Response(content=str(response), media_type="application/xml")
+
+            # Retry 3: prompt alternate ZIP.
+            if session.scheduling_retry_count <= MAX_SCHEDULING_RETRIES:
+                session.stage = "collect_zip"
+                db.commit()
+                response = _say_and_gather(
+                    "I still could not find an available window. Please say another nearby ZIP code, "
+                    "or say agent for callback scheduling.",
+                    "/voice/respond",
+                )
+                return Response(content=str(response), media_type="application/xml")
+
+            return _handoff_response(
+                "I am unable to find an appointment from this call. A representative will follow up to complete scheduling."
             )
-            return Response(content=str(response), media_type="application/xml")
 
         tech, slot = matches[0]
         session.selected_availability_id = slot.id
         session.stage = "confirm_booking"
+        session.scheduling_retry_count = 0
         db.commit()
         response = _say_and_gather(
             f"I found {tech.name} available on {slot.start_time.strftime('%A %B %d at %I:%M %p')}. "

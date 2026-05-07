@@ -87,6 +87,9 @@ class CallSession(Base):
     image_upload_token: Mapped[str | None] = mapped_column(String(120), nullable=True)
     image_uploaded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     image_analysis_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scheduling_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    zip_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class ImageUpload(Base):

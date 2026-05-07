@@ -17,6 +17,11 @@ WINDOW_HOURS = {
 
 def parse_preferred_window(text: str) -> str:
     lowered = text.lower()
+    if any(
+        token in lowered
+        for token in ("any time", "anytime", "whatever", "whenever", "first available", "anything")
+    ):
+        return "any"
     for key in ("morning", "afternoon", "evening"):
         if key in lowered:
             return key
